@@ -13,6 +13,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .composer_window import composer_for_mailto
 from .core.store.database import Database
+from .core.tray import TrayIcon
 from .preferences_dialog import PostcardPreferencesDialog
 from .window import PostcardMainWindow
 
@@ -67,6 +68,13 @@ class PostcardApplication(Adw.Application):
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
         self._load_css()
+        # Kept on self so its D-Bus registrations outlive this call. Hosts
+        # without a StatusNotifier watcher never call back, so this is a no-op
+        # on a plain GNOME session.
+        self._tray = TrayIcon(
+            self,
+            [(_("Show Window"), "focus-mail"), (_("Quit Postcard"), "quit")],
+        )
 
     def do_handle_local_options(self, options: GLib.VariantDict) -> int:
         self._should_start_hidden = options.contains("hidden")

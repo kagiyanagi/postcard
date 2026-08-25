@@ -58,6 +58,7 @@ postcard_core_sources = [
   'postcard/core/compose.py',
   'postcard/core/providers.py',
   'postcard/core/threader.py',
+  'postcard/core/tray.py',
 ]
 
 python_installation.install_sources(postcard_core_sources, subdir: 'postcard/core')
