@@ -2,7 +2,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
@@ -20,6 +20,8 @@ from .core.net.auth import Credential
 from .core.net.imap_session import (
     ATTR_NOSELECT,
     GMAIL_CAPABILITY,
+    IDLE_CAPABILITY,
+    IDLE_RENEW_SECONDS,
     FetchedHeader,
     ImapSession,
     MailboxInfo,
@@ -150,6 +152,38 @@ def fetch_mailbox(
         all_uids=all_uids,
         unread_counts=counts,
     )
+
+
+def watch_inbox(
+    account: Account,
+    credential: Credential,
+    on_change: Callable[[], object],
+    should_stop: Callable[[], bool],
+) -> bool:
+    """Hold an IMAP IDLE on the inbox, calling `on_change` each time the server
+    reports mail arriving, leaving, or being read elsewhere.
+
+    Returns when `should_stop()` says so, and raises when the connection breaks
+    -- reconnecting is the caller's job either way. False means the server has
+    no IDLE, so there is nothing to reconnect for and the poll timer is all
+    there is. `on_change` runs on the calling thread.
+    """
+    session = ImapSession(account.imap_host, account.imap_port, account.imap_security)
+    session.connect()
+    try:
+        session.sign_in(credential)
+        if not session.has_capability(IDLE_CAPABILITY):
+            return False
+        # ponytail: the inbox only. Watching the open folder too means
+        # restarting the connection on every folder click; the poll timer
+        # already covers the rest.
+        session.select(inbox_name([box.name for box in session.list_folders()]))
+        while not should_stop():
+            if session.idle(IDLE_RENEW_SECONDS):
+                on_change()
+    finally:
+        session.logout()
+    return True
 
 
 def _unread_counts(

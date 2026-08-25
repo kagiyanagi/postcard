@@ -3,7 +3,7 @@ from gettext import gettext as _
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
-from .window_types import SETTING_SYNC_INTERVAL
+from .window_types import SETTING_LIVE_SYNC, SETTING_SYNC_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ class PostcardPreferencesDialog(Adw.PreferencesDialog):
     avatars_row: Adw.SwitchRow = Gtk.Template.Child()
     background_row: Adw.SwitchRow = Gtk.Template.Child()
     autostart_row: Adw.SwitchRow = Gtk.Template.Child()
+    live_sync_row: Adw.SwitchRow = Gtk.Template.Child()
     interval_row: Adw.ComboRow = Gtk.Template.Child()
     signature_enabled_row: Adw.SwitchRow = Gtk.Template.Child()
     signature_view: Gtk.TextView = Gtk.Template.Child()
@@ -53,6 +54,7 @@ class PostcardPreferencesDialog(Adw.PreferencesDialog):
         settings.bind("load-remote-images", self.images_row, "active", flags)
         settings.bind("load-sender-avatars", self.avatars_row, "active", flags)
         settings.bind("run-in-background", self.background_row, "active", flags)
+        settings.bind(SETTING_LIVE_SYNC, self.live_sync_row, "active", flags)
         settings.bind("signature-enabled", self.signature_enabled_row, "active", flags)
         settings.bind(
             "signature-enabled",

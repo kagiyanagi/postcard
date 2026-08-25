@@ -7,6 +7,8 @@ from .core.models.folder import Folder
 # preferences_dialog because the window schedules the timer from it and the
 # dialog only writes it -- the window must not have to import a dialog.
 SETTING_SYNC_INTERVAL = "sync-interval-minutes"
+# Whether to hold an IMAP IDLE connection open per account, for the same reason.
+SETTING_LIVE_SYNC = "live-sync"
 
 # Window action names, grouped by what enables and disables them together.
 MAIL_ACTIONS = ("toggle-read", "toggle-star", "archive", "trash", "move")
