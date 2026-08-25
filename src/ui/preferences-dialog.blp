@@ -33,6 +33,11 @@ template $PostcardPreferencesDialog: Adw.PreferencesDialog {
         subtitle: _("Start hidden when you log in and keep checking for mail");
       }
 
+      Adw.SwitchRow live_sync_row {
+        title: _("Live Updates");
+        subtitle: _("Receive mail the moment it arrives, instead of waiting for the next check");
+      }
+
       Adw.ComboRow interval_row {
         title: _("Check for Mail");
         subtitle: _("How often to look for new mail");

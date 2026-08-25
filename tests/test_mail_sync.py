@@ -32,6 +32,7 @@ from postcard.mail_sync import (
     role_for_folder,
     sent_folder,
     server_uids,
+    watch_inbox,
 )
 
 CREDENTIAL = Credential("ada@example.com", "hunter2")
@@ -658,3 +659,62 @@ def test_flagging_nothing_sends_no_command(storing_imap):
     set_flag()
 
     assert storing_imap.stores == []
+
+
+# --- live sync (IMAP IDLE) --------------------------------------------------
+
+
+class IdlingImapSession(FakeImapSession):
+    """An IMAP server whose IDLE hands back a scripted run of answers.
+
+    True is "the mailbox changed", False is "the idle timed out quietly" -- the
+    same two things ImapSession.idle returns.
+    """
+
+    mailboxes = [MailboxInfo("INBOX", "/", ""), MailboxInfo("Sent", "/", "")]
+    has_idle = True
+    replies: list[bool] = []
+    selected = ""
+
+    def has_capability(self, name):
+        return type(self).has_idle
+
+    def select(self, mailbox, is_readonly=True):
+        type(self).selected = mailbox
+        return 0
+
+    def idle(self, timeout):
+        return type(self).replies.pop(0)
+
+
+@pytest.fixture
+def idling_imap(monkeypatch):
+    IdlingImapSession.has_idle = True
+    IdlingImapSession.replies = []
+    IdlingImapSession.selected = ""
+    monkeypatch.setattr(mail_sync, "ImapSession", IdlingImapSession)
+    return IdlingImapSession
+
+
+def test_watch_inbox_reports_a_change_per_idle_that_saw_one(idling_imap):
+    idling_imap.replies = [True, False, True]
+    changes = []
+
+    supported = watch_inbox(
+        account(),
+        CREDENTIAL,
+        lambda: changes.append(1),
+        # Stops once the script has run out, so the loop is finite.
+        lambda: not idling_imap.replies,
+    )
+
+    assert supported is True
+    # The quiet idle in the middle is a renewal, not news.
+    assert len(changes) == 2
+    assert idling_imap.selected == "INBOX"
+
+
+def test_watch_inbox_gives_up_on_a_server_without_idle(idling_imap):
+    idling_imap.has_idle = False
+
+    assert watch_inbox(account(), CREDENTIAL, lambda: None, lambda: False) is False

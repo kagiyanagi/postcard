@@ -1,7 +1,13 @@
+import imaplib
+import socket
 import ssl
+import threading
+import time
+from collections.abc import Iterator
 
 import pytest
 
+from postcard.core.net import imap_session
 from postcard.core.net.auth import MECHANISM_XOAUTH2, Credential
 from postcard.core.net.imap_session import FetchedHeader, ImapError, ImapSession
 
@@ -283,3 +289,162 @@ def test_connect_gives_starttls_a_verifying_context(monkeypatch):
 
     assert imap.calls[0][0] == "STARTTLS"
     _assert_verifies(imap.calls[0][1])
+
+
+# --- idle -------------------------------------------------------------------
+# IDLE is driven through imaplib's internals (the stdlib has none of its own
+# before 3.15), so the fake answers at that level rather than as a command.
+
+
+class IdlingImap(FakeImap):
+    """A server that reads back a scripted run of untagged lines.
+
+    It stands in for the socket too: a line left in the script means the socket
+    is ready, an empty script means a quiet mailbox.
+    """
+
+    def __init__(self, lines, response=None):
+        super().__init__()
+        self.lines = list(lines)
+        self._response = response
+
+    def socket(self):
+        return self
+
+    def _command(self, name):
+        self.calls.append((name,))
+        return b"TAG1"
+
+    def _get_response(self):
+        return self._response
+
+    def _get_line(self):
+        return self.lines.pop(0)
+
+    def send(self, data):
+        self.calls.append(("SEND", data))
+
+    def _command_complete(self, name, tag):
+        self.calls.append(("COMPLETE", name, tag))
+
+
+def idling(monkeypatch, imap: IdlingImap) -> ImapSession:
+    monkeypatch.setattr(
+        imap_session.select,
+        "select",
+        lambda _r, _w, _x, _timeout: ([imap] if imap.lines else [], [], []),
+    )
+    return connect(monkeypatch, imap)
+
+
+@pytest.mark.parametrize("line", [b"* 5 EXISTS", b"* 3 EXPUNGE", b"* 3 FETCH (FLAGS)"])
+def test_idle_reports_the_untagged_replies_that_mean_news(monkeypatch, line):
+    assert idling(monkeypatch, IdlingImap([line])).idle(60) is True
+
+
+def test_a_quiet_idle_reports_no_change(monkeypatch):
+    assert idling(monkeypatch, IdlingImap([])).idle(60) is False
+
+
+def test_a_keepalive_is_not_news_and_the_idle_keeps_waiting(monkeypatch):
+    imap = IdlingImap([b"* OK Still here"])
+    session = idling(monkeypatch, imap)
+
+    assert session.idle(60) is False
+    assert imap.lines == []
+
+
+def test_the_idle_is_always_ended(monkeypatch):
+    imap = IdlingImap([b"* 5 EXISTS"])
+
+    idling(monkeypatch, imap).idle(60)
+
+    # Left running, it would answer the next command the session sends.
+    assert ("SEND", b"DONE\r\n") in imap.calls
+    assert ("COMPLETE", "IDLE", b"TAG1") in imap.calls
+
+
+def test_a_server_that_refuses_to_idle_is_an_error(monkeypatch):
+    # A tagged reply where imaplib reports the "+ idling" continuation as None.
+    imap = IdlingImap([], response=b"TAG1 BAD no idling here")
+    session = idling(monkeypatch, imap)
+
+    with pytest.raises(ImapError, match="would not enter IDLE"):
+        session.idle(60)
+    assert ("SEND", b"DONE\r\n") not in imap.calls
+
+
+# --- idle over a socket -----------------------------------------------------
+# The fake above answers at imaplib's private API, which is the half of this
+# that can drift between Python versions -- 3.13 and 3.14 already differ on
+# what a timed out read does to a socket. So one test drives the whole thing
+# over a real socket with real imaplib on top.
+
+IDLE_SERVER_SCRIPT = {
+    b"CAPABILITY": [b"* CAPABILITY IMAP4rev1 IDLE"],
+    b"EXAMINE": [b"* 3 EXISTS"],
+}
+
+
+def serve_idle(server: socket.socket, pushes: Iterator[list[bytes]]) -> None:
+    """Answer one client with just enough IMAP to be idled on.
+
+    `pushes` yields the untagged lines to send during each IDLE in turn, each
+    one a moment after the "+ idling" so it lands in its own packet -- the way
+    a server that has been sitting there quietly sends it.
+    """
+    connection, _ = server.accept()
+    with connection, connection.makefile("rwb") as stream:
+        stream.write(b"* OK fake imap ready\r\n")
+        stream.flush()
+        while line := stream.readline():
+            tag, _, rest = line.strip().partition(b" ")
+            command = rest.split(b" ")[0].upper()
+            if command == b"IDLE":
+                stream.write(b"+ idling\r\n")
+                stream.flush()
+                for push in next(pushes, []):
+                    time.sleep(0.05)
+                    stream.write(push + b"\r\n")
+                    stream.flush()
+                while (done := stream.readline()).strip() != b"DONE":
+                    if not done:
+                        return
+                stream.write(tag + b" OK IDLE terminated\r\n")
+            elif command == b"LOGOUT":
+                stream.write(b"* BYE\r\n" + tag + b" OK bye\r\n")
+                stream.flush()
+                return
+            else:
+                for untagged in IDLE_SERVER_SCRIPT.get(command, []):
+                    stream.write(untagged + b"\r\n")
+                stream.write(tag + b" OK " + command + b" done\r\n")
+            stream.flush()
+
+
+def test_a_quiet_idle_leaves_the_session_fit_for_the_next_one(monkeypatch):
+    server = socket.create_server(("127.0.0.1", 0))
+    pushes = iter([[], [b"* 5 EXISTS"]])
+    thread = threading.Thread(target=serve_idle, args=(server, pushes), daemon=True)
+    thread.start()
+
+    monkeypatch.setattr(
+        "postcard.core.net.imap_session.imaplib.IMAP4_SSL",
+        lambda host, port, ssl_context=None, timeout=None: imaplib.IMAP4(
+            host, port, timeout=timeout
+        ),
+    )
+    session = ImapSession("127.0.0.1", server.getsockname()[1])
+    session.connect()
+    try:
+        session.sign_in(Credential("ada@example.com", "hunter2"))
+        assert session.has_capability("IDLE")
+        session.select("INBOX")
+
+        # The renewal every 20 minutes runs on this: a quiet idle that has to
+        # leave the connection usable, or live sync costs a reconnect an hour.
+        assert session.idle(0.2) is False
+        assert session.idle(5) is True
+    finally:
+        session.logout()
+        server.close()

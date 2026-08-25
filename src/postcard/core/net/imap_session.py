@@ -3,6 +3,8 @@ import email
 import imaplib
 import logging
 import re
+import select
+import time
 from email import policy
 from typing import NamedTuple
 
@@ -27,6 +29,22 @@ ATTR_NOSELECT = "\\Noselect"
 # Gmail files its own copy of everything sent through it. This capability is how
 # it identifies itself, so we don't append a second copy on top.
 GMAIL_CAPABILITY = "X-GM-EXT-1"
+
+# RFC 2177 push. A server is free to drop an IDLE after 30 minutes, so it is
+# re-issued well inside that; the renewal doubles as the liveness check on a
+# connection that was parked across a suspend.
+IDLE_CAPABILITY = "IDLE"
+IDLE_RENEW_SECONDS = 20 * 60
+
+# The untagged replies that mean the mailbox changed: mail arrived, left, or was
+# read elsewhere. A server may also send keepalives through an idle connection
+# ("* OK Still here"), which are not news.
+_IDLE_EVENT = re.compile(rb"^\* \d+ (EXISTS|EXPUNGE|FETCH)\b")
+
+# imaplib only learned IDLE in 3.15, and the runtime is on 3.13. _command()
+# refuses any verb missing from this table, so IDLE is registered here with the
+# state RFC 2177 allows it in.
+imaplib.Commands.setdefault(IDLE_CAPABILITY, ("SELECTED",))
 
 
 class MailboxInfo(NamedTuple):
@@ -205,6 +223,51 @@ class ImapSession:
         if match is None:
             raise ImapError(f"no UNSEEN in the status of {mailbox}: {payload}")
         return int(match.group(1))
+
+    def idle(self, timeout: float) -> bool:
+        """Wait for the selected mailbox to change; True when it did.
+
+        False means `timeout` seconds passed with no news. Either way the IDLE
+        is ended before returning, so the session stays usable -- the caller
+        renews it in a loop. Driven through the same imaplib internals its own
+        commands use: the stdlib has no IDLE of its own before Python 3.15.
+        """
+        imap = self._require_imap()
+        sock = imap.socket()
+        deadline = time.monotonic() + timeout
+        try:
+            tag = imap._command(IDLE_CAPABILITY)  # noqa: SLF001
+            # imaplib reports a continuation ("+ idling") as None; anything else
+            # is the server answering the command instead of entering IDLE.
+            if imap._get_response() is not None:  # noqa: SLF001
+                raise ImapError(f"{self._host} would not enter IDLE")
+            try:
+                has_changed = False
+                while not has_changed:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # select() rather than a read timeout: on Python 3.13 a
+                    # timed out read poisons the socket's file object for good
+                    # (socket.SocketIO), so every quiet renewal would cost a
+                    # reconnect.
+                    if not select.select([sock], [], [], remaining)[0]:
+                        break
+                    # ponytail: one line per wakeup, so a second line that
+                    # shared the same packet sits unread in the buffer --
+                    # select() cannot see it -- and is dropped when the idle
+                    # ends. It takes mail landing in the same instant as a
+                    # keepalive to hit, and the poll timer is the backstop.
+                    line = imap._get_line()  # noqa: SLF001
+                    has_changed = _IDLE_EVENT.match(line) is not None
+                return has_changed
+            finally:
+                # Ended here rather than left running into whatever command the
+                # caller sends next.
+                imap.send(b"DONE\r\n")
+                imap._command_complete(IDLE_CAPABILITY, tag)  # noqa: SLF001
+        except (OSError, imaplib.IMAP4.error) as error:
+            raise ImapError(f"idle on {self._host} failed: {error}") from error
 
     def has_capability(self, name: str) -> bool:
         """Whether the server advertises a capability. imaplib upper-cases the

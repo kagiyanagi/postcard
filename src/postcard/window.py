@@ -44,6 +44,7 @@ from .window_types import (
     REPLY_FORWARD_ACTIONS,
     SEARCH_DEBOUNCE_MS,
     SECONDS_PER_MINUTE,
+    SETTING_LIVE_SYNC,
     SETTING_SYNC_INTERVAL,
     BodyRequest,
     FlagChange,
@@ -55,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 SETTING_FOLDER_WIDTH = "folder-sidebar-width"
 SETTING_CONVERSATION_WIDTH = "conversation-sidebar-width"
+
+# How long a live-sync watcher waits before reconnecting after its connection
+# broke, so an unreachable server isn't hammered.
+LIVE_SYNC_RETRY_SECONDS = 60
 
 # Move is the one action carrying a parameter (the destination folder name), so
 # it is registered on its own wherever these are.
@@ -190,8 +195,14 @@ class PostcardMainWindow(Adw.ApplicationWindow):
         # on the same tick.
         self._syncing_account_ids: set[int] = set()
         self._sync_timer_id = 0
+        # Set to stop the live-sync watcher threads; replaced, never cleared,
+        # so a thread still parked in a socket read keeps its own old event.
+        self._live_stop = threading.Event()
         self._interval_handler = self._settings.connect(
             f"changed::{SETTING_SYNC_INTERVAL}", lambda *_: self._reschedule_sync()
+        )
+        self._live_sync_handler = self._settings.connect(
+            f"changed::{SETTING_LIVE_SYNC}", lambda *_: self._restart_live_sync()
         )
 
         self.connect("close-request", self._on_close_request)
@@ -298,6 +309,7 @@ class PostcardMainWindow(Adw.ApplicationWindow):
         self._reload_folders()
 
         self._reschedule_sync()
+        self._restart_live_sync()
         if self._is_online:
             self._sync_all(in_background=True)
 
@@ -393,8 +405,10 @@ class PostcardMainWindow(Adw.ApplicationWindow):
 
         self._network.disconnect(self._network_handler)
         self._settings.disconnect(self._interval_handler)
+        self._settings.disconnect(self._live_sync_handler)
         self._settings.disconnect(self._avatar_handler)
         self._avatars.shutdown()
+        self._live_stop.set()
         if self._sync_timer_id:
             GLib.source_remove(self._sync_timer_id)
 
@@ -444,12 +458,14 @@ class PostcardMainWindow(Adw.ApplicationWindow):
             self._accounts = {}
             self._account = None
             self._current_folder = None
+            self._restart_live_sync()
             self.main_stack.set_visible_child_name(PAGE_NO_ACCOUNT)
             return
         if self._account is None:
             self._load_mail_view()
             return
         self._reload_folders()
+        self._restart_live_sync()
 
     def _on_add_account_clicked(self, *_args: object) -> None:
         dialog = PostcardAccountDialog(self._db)
@@ -468,6 +484,7 @@ class PostcardMainWindow(Adw.ApplicationWindow):
             self._load_mail_view()
             return
         self._reload_folders()
+        self._restart_live_sync()
         # Highest id sorts last, so this is the one just added.
         self._start_sync(self._db.accounts()[-1], in_background=True)
 
@@ -2105,7 +2122,9 @@ class PostcardMainWindow(Adw.ApplicationWindow):
                 account, in_background=in_background, folder_name=folder_name
             )
 
-    # Refresh on a timer using the configured interval (0 = manual only).
+    # Refresh on a timer using the configured interval (0 = manual only). The
+    # timer is the fallback while live sync is on: it covers servers without
+    # IDLE, and the folders the watcher doesn't sit on.
     def _reschedule_sync(self) -> None:
         if self._sync_timer_id:
             GLib.source_remove(self._sync_timer_id)
@@ -2120,6 +2139,71 @@ class PostcardMainWindow(Adw.ApplicationWindow):
         if self._accounts and self._is_online:
             self._sync_all(in_background=True)
         return True
+
+    # One connection per account parked in IMAP IDLE, so the server pushes new
+    # mail the moment it lands instead of waiting for the next tick. Restarted
+    # rather than adjusted: replacing the stop event retires every old watcher
+    # at once, so no account can end up with two.
+    def _restart_live_sync(self) -> None:
+        self._live_stop.set()
+        self._live_stop = threading.Event()
+        if not self._is_online or not self._settings.get_boolean(SETTING_LIVE_SYNC):
+            return
+        for account in self._accounts.values():
+            logger.debug(
+                "live sync watching %s on %s", account.email, account.imap_host
+            )
+            threading.Thread(
+                target=self._live_worker,
+                args=(account, self._live_stop),
+                daemon=True,
+            ).start()
+
+    # Runs on the worker thread: network only, no Gtk/database access. A dropped
+    # IDLE is routine (servers hang up, laptops suspend), so it reconnects
+    # instead of giving up -- the account's own error reporting stays with the
+    # poll timer, which is still running.
+    def _live_worker(self, account: Account, stop: threading.Event) -> None:
+        while not stop.is_set():
+            credential = secrets.credential_for(account)
+            if credential is None:
+                logger.warning("could not sign in to account %s", account.email)
+                return
+            try:
+                has_idle = mail_sync.watch_inbox(
+                    account,
+                    credential,
+                    lambda: GLib.idle_add(self._on_live_change, account, stop),
+                    stop.is_set,
+                )
+            except Exception:
+                logger.warning(
+                    "live sync dropped for %s on %s; reconnecting",
+                    account.email,
+                    account.imap_host,
+                    exc_info=True,
+                )
+            else:
+                if not has_idle:
+                    logger.info(
+                        "%s does not support IMAP IDLE; polling %s instead",
+                        account.imap_host,
+                        account.email,
+                    )
+                    return
+            stop.wait(LIVE_SYNC_RETRY_SECONDS)
+
+    # Back on the main thread. A watcher can be one socket read behind its stop
+    # event, so the push it delivers may belong to an account that has since
+    # been removed or replaced.
+    def _on_live_change(self, account: Account, stop: threading.Event) -> bool:
+        if stop.is_set() or self._is_stale(account):
+            return False
+        # The one line that separates "the server pushed" from "the timer went
+        # off" when someone reports that new mail is slow to show up.
+        logger.debug("live sync push for %s", account.email)
+        self._start_sync(account, in_background=True)
+        return False
 
     # Runs on the worker thread: network only, no Gtk/database access.
     def _sync_worker(
@@ -2353,6 +2437,7 @@ class PostcardMainWindow(Adw.ApplicationWindow):
 
     def _on_banner_retry(self, _banner: Adw.Banner) -> None:
         self.connection_banner.set_revealed(False)
+        self._restart_live_sync()
         if self._accounts:
             self._sync_all()
 
@@ -2363,10 +2448,14 @@ class PostcardMainWindow(Adw.ApplicationWindow):
         if is_available == self._is_online:
             return
         self._is_online = is_available
+        # Either way the watchers restart: on the way down to drop them, on the
+        # way back up because their connections went with the network.
         if not is_available:
+            self._restart_live_sync()
             self._show_offline_banner()
             return
         self.connection_banner.set_revealed(False)
+        self._restart_live_sync()
         if self._accounts:
             self._sync_all()
 
